@@ -880,7 +880,7 @@ function showMainMenu() {
     : `<button class="opt" data-act="appUpdate"><span class="lbl">检查 App 更新（当前 v${esc(appVersion)}）</span></button>`;
   const hostTag = activeHost()?.name ? `<span class="tag">${esc(activeHost().name)}</span>` : '';
   openSheet('main', `<h3>菜单</h3>
-    <button class="opt" data-act="hosts"><span class="lbl">我的电脑<span class="sub">在多台 Windows / Mac 之间切换</span></span>${hostTag}</button>
+    <button class="opt" data-act="hosts"><span class="lbl">我的电脑<span class="sub">多台电脑切换 · v9</span></span>${hostTag}</button>
     ${notifyItem}
     ${inApp && appVersion ? update : ''}
     ${inApp ? '<button class="opt" data-act="changeUrl"><span class="lbl">更换 App 壳地址<span class="sub">一般不用改；添加电脑请用「我的电脑」</span></span></button>'
