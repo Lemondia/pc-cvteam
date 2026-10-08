@@ -296,6 +296,129 @@ let crop = store.get('crop') !== 'full';
 let frame = { w: 1000, h: 800 }, panel = null, zoom = 1, tapMode = 'tap', rightNext = false;
 let windows = [], currentWindow = null;
 
+/* ---------- multi-host profiles (one phone ↔ many computers) ---------- */
+const appAddress = () => location.origin + location.pathname.replace(/index\.html$/, '');
+function normalizeAppUrl(href) {
+  const u = new URL(href, location.href);
+  let path = u.pathname.replace(/\/index\.html$/i, '');
+  if (!path.endsWith('/')) path += '/';
+  return u.origin + path;
+}
+function hostIdFor(appUrl) {
+  let h = 0;
+  for (let i = 0; i < appUrl.length; i++) h = ((h << 5) - h + appUrl.charCodeAt(i)) | 0;
+  return 'h' + (h >>> 0).toString(36);
+}
+function guessHostName(appUrl) {
+  try {
+    const u = new URL(appUrl);
+    const seg = u.pathname.replace(/\/+$/, '').split('/').filter(Boolean).pop() || u.host;
+    if (/cursor-remote-app$/i.test(seg)) return '电脑 1';
+    const m = /cursor-remote-app[-_]?(.+)/i.exec(seg);
+    if (m) return m[1];
+    return seg;
+  } catch { return '电脑'; }
+}
+function loadHosts() {
+  try { return JSON.parse(store.get('hosts') || '[]'); } catch { return []; }
+}
+function saveHosts(list) { store.set('hosts', JSON.stringify(list)); }
+function migrateHosts() {
+  let hosts = loadHosts();
+  const key = store.get('key'), token = store.get('token');
+  const appUrl = normalizeAppUrl(store.get('appUrl') || appAddress());
+  if (key && token) {
+    const i = hosts.findIndex(h => h.appUrl === appUrl);
+    if (i < 0) {
+      hosts.push({ id: hostIdFor(appUrl), name: guessHostName(appUrl), appUrl, key, token, window: store.get('window') || '', lastUsed: Date.now() });
+      saveHosts(hosts);
+    } else {
+      hosts[i] = { ...hosts[i], key, token, window: store.get('window') || hosts[i].window || '', lastUsed: Date.now() };
+      saveHosts(hosts);
+    }
+    if (!store.get('activeHost')) store.set('activeHost', hostIdFor(appUrl));
+  }
+  if (!store.get('activeHost') && hosts[0]) store.set('activeHost', hosts[0].id);
+  return loadHosts();
+}
+function activeHost() {
+  const hosts = migrateHosts();
+  const id = store.get('activeHost');
+  return hosts.find(h => h.id === id) || hosts[0] || null;
+}
+function upsertHost(partial) {
+  const appUrl = normalizeAppUrl(partial.appUrl || appAddress());
+  const hosts = loadHosts();
+  const id = partial.id || hostIdFor(appUrl);
+  const i = hosts.findIndex(h => h.id === id || h.appUrl === appUrl);
+  const prev = i >= 0 ? hosts[i] : { id, name: guessHostName(appUrl), appUrl, key: '', token: '', window: '', lastUsed: 0 };
+  const next = {
+    ...prev,
+    ...partial,
+    id,
+    appUrl,
+    name: (partial.name || prev.name || guessHostName(appUrl)).trim() || guessHostName(appUrl),
+    lastUsed: Date.now(),
+  };
+  if (i >= 0) hosts[i] = next; else hosts.push(next);
+  saveHosts(hosts);
+  return next;
+}
+function persistActiveHost() {
+  const h = activeHost();
+  if (!h) return null;
+  return upsertHost({
+    id: h.id,
+    appUrl: h.appUrl,
+    name: h.name,
+    key: store.get('key') || h.key || '',
+    token: store.get('token') || h.token || '',
+    window: store.get('window') || '',
+  });
+}
+function applyHost(h) {
+  if (!h) return;
+  store.set('activeHost', h.id);
+  store.set('appUrl', h.appUrl);
+  store.set('key', h.key || null);
+  store.set('token', h.token || null);
+  store.set('window', h.window || null);
+}
+function shellAppUrl() {
+  return normalizeAppUrl(activeHost()?.appUrl || store.get('appUrl') || appAddress());
+}
+async function switchHost(id) {
+  if (activeHost()?.id === id) return status('已是当前电脑');
+  persistActiveHost();
+  const h = loadHosts().find(x => x.id === id);
+  if (!h) return status('找不到这台电脑', false);
+  if (!h.key || !h.token) return status('这台电脑还没有配对信息', false);
+  authed = false;
+  try { ws?.close(); } catch {}
+  ws = null;
+  applyHost(h);
+  status('正在切换电脑…');
+  boot();
+}
+async function removeHost(id) {
+  const hosts = loadHosts().filter(h => h.id !== id);
+  saveHosts(hosts);
+  if (store.get('activeHost') === id) {
+    store.set('activeHost', hosts[0]?.id || null);
+    if (hosts[0]) {
+      applyHost(hosts[0]);
+      authed = false;
+      try { ws?.close(); } catch {}
+      boot();
+    } else {
+      store.set('key', null); store.set('token', null); store.set('appUrl', null);
+      authed = false;
+      try { ws?.close(); } catch {}
+      showUnpaired();
+    }
+  }
+}
+
 // Keep the layout above the on-screen keyboard.
 function fitViewport() {
   const vv = window.visualViewport;
@@ -356,7 +479,10 @@ async function decryptUrl(keyText) {
 
 const offline = msg => Object.assign(new Error(msg), { offline: true });
 async function resolveBase() {
-  if (info.self) return location.origin;
+  if (info.self) {
+    const app = shellAppUrl();
+    try { return new URL(app).origin; } catch { return location.origin; }
+  }
   if (info.v !== 2 || !info.data) throw offline('电脑端还没有发布地址（或还在用旧版本），请在电脑上重启服务');
   const key = store.get('key');
   if (!key) throw Object.assign(new Error(''), { unpaired: true });
@@ -381,7 +507,10 @@ function parsePair(text) {
   return m ? { key: m[1], code: m[2] } : null;
 }
 let pending = parsePair(location.hash);
-if (pending) history.replaceState(null, '', location.pathname + location.search);
+if (pending) {
+  pending.appUrl = normalizeAppUrl(appAddress());
+  history.replaceState(null, '', location.pathname + location.search);
+}
 // Opened from a notification: <app>#win=<window id>.
 {
   const m = /[#&]win=([^&]+)/.exec(location.hash);
@@ -394,7 +523,7 @@ window.addEventListener('hashchange', () => {
   const p = parsePair(location.hash);
   if (!p) return;
   history.replaceState(null, '', location.pathname + location.search);
-  pending = p;
+  pending = { ...p, appUrl: normalizeAppUrl(appAddress()) };
   boot();
 });
 store.set('pw', null);
@@ -407,11 +536,16 @@ function deviceName() {
 }
 
 function showUnpaired(msg = '') {
+  const others = loadHosts().filter(h => h.token && h.key);
   gate({
-    msg: (msg ? msg + '\n\n' : '') + '这台设备还没有配对。\n在电脑上运行 npm run pair，用手机扫码；或者把链接复制过来粘贴到下面。',
+    msg: (msg ? msg + '\n\n' : '') + (others.length
+      ? '当前没有可用的电脑连接。\n可粘贴另一台电脑的配对链接，或从菜单「我的电脑」切换。'
+      : '这台设备还没有配对。\n在电脑上运行 npm run pair，用手机扫码；或者把链接复制过来粘贴到下面。'),
     err: !!msg,
     input: { placeholder: '粘贴配对链接', button: '配对', submit: pastePair },
+    retry: others.length ? '打开我的电脑' : false,
   });
+  if (others.length) $('gateRetry').onclick = () => { ungate(); showHosts(); };
 }
 
 function pastePair(text) {
@@ -419,14 +553,23 @@ function pastePair(text) {
   if (!p) return showUnpaired('这不是配对链接（应包含 #pair=…）');
   let target;
   try { target = new URL(text.trim()); } catch {}
-  const here = location.origin + location.pathname;
-  // A link for another app address: switch to it (the Android app remembers the new address).
-  if (target && /^https?:$/.test(target.protocol) && target.origin + target.pathname !== here) {
-    if (inApp) return window.CursorRemoteApp.setUrl(target.href);
-    location.href = target.href;
+  // Different host/path: keep pairing in-place via absolute url.json (same github.io origin shares storage).
+  if (target && /^https?:$/.test(target.protocol)) {
+    const appUrl = normalizeAppUrl(target.href);
+    const here = normalizeAppUrl(appAddress());
+    if (appUrl !== here && target.host !== location.host) {
+      // Truly different origin: let the Android shell / browser navigate.
+      if (inApp) return window.CursorRemoteApp.setUrl(target.href);
+      location.href = target.href;
+      return;
+    }
+    pending = { ...p, appUrl };
+    upsertHost({ appUrl, key: p.key });
+    applyHost(upsertHost({ appUrl, key: p.key }));
+    boot();
     return;
   }
-  pending = p;
+  pending = { ...p, appUrl: shellAppUrl() };
   boot();
 }
 
@@ -449,6 +592,8 @@ async function pair(totp) {
   }
   if (r.ok) {
     store.set('token', body.token);
+    const appUrl = pending?.appUrl || shellAppUrl();
+    applyHost(upsertHost({ appUrl, key: store.get('key') || pending?.key, token: body.token }));
     pending = null;
     return connect();
   }
@@ -473,25 +618,45 @@ async function verifyTotp(code) {
 async function boot() {
   authed = false;
   clearTimeout(retryTimer);
+  $('gateRetry').onclick = () => boot();
+  migrateHosts();
   // Android browser opened a pairing link: offer to hand it to the installed app instead.
   if (pending && /Android/.test(navigator.userAgent) && !inApp && !pending.stay) {
-    const link = `cursorremote://pair?app=${encodeURIComponent(location.origin + location.pathname)}&d=${pending.key}.${pending.code}`;
+    const app = pending.appUrl || (location.origin + location.pathname);
+    const link = `cursorremote://pair?app=${encodeURIComponent(app)}&d=${pending.key}.${pending.code}`;
     gate({ msg: '已收到配对链接。\n装了安卓 App 就在 App 里打开；否则直接在浏览器里用。', appLink: link, retry: '在浏览器里继续' });
     pending.stay = true;
+    $('gateRetry').onclick = () => boot();
     return;
   }
-  gate({ msg: '正在查找电脑…' });
+  const host = activeHost();
+  const looking = host?.name ? `正在查找「${host.name}」…` : '正在查找电脑…';
+  gate({ msg: looking });
+  const appBase = pending?.appUrl || host?.appUrl || shellAppUrl();
   try {
-    info = await fetch('url.json?t=' + Date.now(), { cache: 'no-store' }).then(r => r.json());
+    info = await fetch(new URL('url.json?t=' + Date.now(), appBase).href, { cache: 'no-store' }).then(r => {
+      if (!r.ok) throw new Error('bad');
+      return r.json();
+    });
   } catch {
-    return gate({ msg: '读取失败，请检查手机网络', err: true, retry: true });
+    return gate({ msg: '读取失败，请检查手机网络或该电脑的 App 地址', err: true, retry: true });
   }
-  if (pending) store.set('key', pending.key);
+  if (pending) {
+    store.set('key', pending.key);
+    const h = upsertHost({ appUrl: appBase, key: pending.key });
+    applyHost(h);
+  } else if (host) {
+    applyHost(host);
+  }
   try {
     base = await resolveBase();
   } catch (e) {
     if (e.offline) return gate({ msg: e.message, retry: true });
-    if (e.stale) { store.set('key', null); store.set('token', null); }
+    if (e.stale) {
+      store.set('key', null); store.set('token', null);
+      const dead = activeHost();
+      if (dead) upsertHost({ id: dead.id, appUrl: dead.appUrl, name: dead.name, key: '', token: '' });
+    }
     return showUnpaired(e.message);
   }
   if (pending) return pair();
@@ -505,9 +670,12 @@ async function boot() {
   }
   if (!me.paired) {
     store.set('token', null);
+    const dead = activeHost();
+    if (dead) upsertHost({ id: dead.id, appUrl: dead.appUrl, name: dead.name, key: dead.key, token: '' });
     return showUnpaired('这台设备已被移除，请重新配对');
   }
   if (me.needTotp) return showTotp(verifyTotp);
+  persistActiveHost();
   connect();
 }
 
@@ -544,7 +712,9 @@ function connect() {
       authed = true; failures = 0;
       ungate();
       $('dot').className = 'ok';
-      status('已连接');
+      const hostName = activeHost()?.name;
+      status(hostName ? `已连接 · ${hostName}` : '已连接');
+      persistActiveHost();
       send({ t: 'mode', mode });
       send({ t: 'windows' });
       const fromNotice = window.CursorRemoteApp?.takeOpenWin?.();
@@ -667,7 +837,28 @@ async function showDevices() {
   openSheet('devices', `<h3>已配对设备</h3>` + list.map(d => `
     <div class="opt ${d.current ? 'cur' : ''}"><span class="lbl">${esc(d.name)}<span class="sub">配对于 ${when(d.created)} · 最近使用 ${when(d.lastSeen)}</span></span>
     ${d.current ? '' : `<button data-remove="${esc(d.id)}" data-name="${esc(d.name)}">移除</button>`}</div>`).join('')
-    + '<div class="hint">添加新设备：在电脑上运行 npm run pair。<br>开启 Authenticator 二次验证：npm run 2fa。</div>');
+    + '<div class="hint">这里是「当前这台电脑」上已配对的手机。添加另一台电脑请用菜单「我的电脑」。</div>');
+}
+
+function showHosts() {
+  migrateHosts();
+  const hosts = loadHosts().slice().sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
+  const cur = store.get('activeHost');
+  const rows = hosts.length ? hosts.map(h => {
+    const ready = h.key && h.token;
+    const isCur = h.id === cur;
+    return `<div class="opt ${isCur ? 'cur' : ''}">
+      <span class="lbl">${esc(h.name)}${isCur ? '（当前）' : ''}<span class="sub">${esc(h.appUrl)}${ready ? '' : ' · 未配对'}</span></span>
+      <span style="display:flex;gap:6px;flex:none">
+        ${isCur ? '' : `<button data-host-switch="${esc(h.id)}" ${ready ? '' : 'disabled'}>切换</button>`}
+        <button data-host-rename="${esc(h.id)}" data-name="${esc(h.name)}">改名</button>
+        <button data-host-del="${esc(h.id)}" data-name="${esc(h.name)}">删除</button>
+      </span>
+    </div>`;
+  }).join('') : '<div class="hint">还没有保存的电脑。先在一台电脑上 npm run pair 完成配对。</div>';
+  openSheet('hosts', `<h3>我的电脑</h3>${rows}
+    <button class="opt" data-act="hostAdd"><span class="lbl">添加 / 配对另一台电脑<span class="sub">粘贴那台电脑上 npm run pair 的链接</span></span></button>
+    <div class="hint">每台电脑各自部署 Cursor Remote Lite 并创建自己的 GitHub Pages 仓库，再分别配对。切换时只会连接当前选中的那一台。</div>`);
 }
 
 function showDonate() {
@@ -687,16 +878,18 @@ function showMainMenu() {
   const update = apkUpdate()
     ? `<button class="opt" data-act="appUpdate"><span class="lbl">更新安卓 App（v${esc(appVersion)} → v${esc(apkUpdate())}）</span><span class="tag">新</span></button>`
     : `<button class="opt" data-act="appUpdate"><span class="lbl">检查 App 更新（当前 v${esc(appVersion)}）</span></button>`;
+  const hostTag = activeHost()?.name ? `<span class="tag">${esc(activeHost().name)}</span>` : '';
   openSheet('main', `<h3>菜单</h3>
+    <button class="opt" data-act="hosts"><span class="lbl">我的电脑<span class="sub">在多台 Windows / Mac 之间切换</span></span>${hostTag}</button>
     ${notifyItem}
     ${inApp && appVersion ? update : ''}
-    ${inApp ? '<button class="opt" data-act="changeUrl"><span class="lbl">更换 App 地址</span></button>'
+    ${inApp ? '<button class="opt" data-act="changeUrl"><span class="lbl">更换 App 壳地址<span class="sub">一般不用改；添加电脑请用「我的电脑」</span></span></button>'
       : standalone() ? '' : '<button class="opt" data-act="install"><span class="lbl">安装到手机桌面（像 App 一样打开）</span></button>'}
     <button class="opt" data-act="reconnect"><span class="lbl">重新连接</span></button>
     <button class="opt" data-act="voice"><span class="lbl">语音按钮<span class="sub">输入法键盘自带麦克风的话用不着</span></span><span class="switch ${store.get('voice') === 'on' ? 'on' : ''}"></span></button>
     <button class="opt" data-act="lang"><span class="lbl">语言 / Language</span><span class="tag">${I18N.lang === 'en' ? 'English' : '中文'}</span></button>
-    <button class="opt" data-act="devices"><span class="lbl">已配对设备</span></button>
-    <button class="opt" data-act="logout"><span class="lbl">取消本机配对</span></button>
+    <button class="opt" data-act="devices"><span class="lbl">已配对设备<span class="sub">当前这台电脑上的手机列表</span></span></button>
+    <button class="opt" data-act="logout"><span class="lbl">取消当前电脑配对</span></button>
     ${donate ? '<button class="opt" data-act="donate"><span class="lbl">赞赏作者 ☕</span></button>' : ''}`);
 }
 $('menuBtn').onclick = showMainMenu;
@@ -706,7 +899,6 @@ const APK_RELEASE = 'https://github.com/Suchenl/cursor-remote-lite/releases/late
 // A copy on the user's own GitHub Pages downloads more reliably in mainland China than GitHub Releases.
 let apkUrl = APK_RELEASE;
 fetch('CursorRemote.apk', { method: 'HEAD' }).then(r => { if (r.ok) apkUrl = new URL('CursorRemote.apk', location.href).href; }).catch(() => {});
-const appAddress = () => location.origin + location.pathname.replace(/index\.html$/, '');
 
 // The page itself updates with GitHub Pages; only the Android shell needs a new APK now and then.
 const appVersion = /CursorRemoteApp\/v?([\d.]+)/.exec(navigator.userAgent)?.[1];
@@ -751,7 +943,7 @@ let notifyOn = false;
 
 const swReady = () => Promise.race([navigator.serviceWorker.ready, sleep(5000).then(() => { throw new Error('通知组件没有加载，请刷新后再试'); })]);
 const pushSub = async () => webPush() ? (await swReady()).pushManager.getSubscription() : null;
-const nativeConfig = () => JSON.stringify({ app: appAddress(), key: store.get('key') || '', token: store.get('token') || '' });
+const nativeConfig = () => JSON.stringify({ app: shellAppUrl(), key: store.get('key') || '', token: store.get('token') || '' });
 
 // After every connect: refresh the menu state and re-register, since re-pairing gives the device a new id.
 async function syncNotify() {
@@ -878,16 +1070,53 @@ $('sheet').addEventListener('click', async e => {
     b.querySelector('.switch').classList.toggle('on', store.get('voice') === 'on');
   }
   else if (act === 'devices') showDevices();
+  else if (act === 'hosts') showHosts();
+  else if (act === 'hostAdd') {
+    closeSheet();
+    gate({
+      msg: '在另一台电脑上运行 npm run pair，把配对链接粘贴到这里。\n会添加到「我的电脑」列表，不会丢掉当前这台。',
+      input: { placeholder: '粘贴配对链接', button: '添加并配对', submit: text => { ungate(); pastePair(text); } },
+      retry: '取消',
+    });
+    $('gateRetry').onclick = () => { ungate(); $('gateRetry').onclick = () => boot(); };
+  }
+  else if (b.dataset.hostSwitch) { closeSheet(); switchHost(b.dataset.hostSwitch); }
+  else if (b.dataset.hostRename) {
+    const id = b.dataset.hostRename;
+    const old = b.dataset.name || '';
+    gate({
+      msg: '给这台电脑起个好认的名字（例如：家里台式 / 公司本 / MacBook）',
+      input: { placeholder: old || '电脑名称', button: '保存', submit: name => {
+        const n = (name || '').trim();
+        if (!n) return;
+        const h = loadHosts().find(x => x.id === id);
+        if (h) upsertHost({ ...h, name: n });
+        ungate();
+        showHosts();
+      } },
+      retry: '取消',
+    });
+    $('gateInput').value = old;
+    $('gateRetry').onclick = () => { ungate(); showHosts(); $('gateRetry').onclick = () => boot(); };
+  }
+  else if (b.dataset.hostDel) {
+    if (!await ask(`从手机删除「${b.dataset.name}」？\n不会影响电脑端，之后可重新配对。`, '删除')) return showHosts();
+    closeSheet();
+    await removeHost(b.dataset.hostDel);
+    if (loadHosts().length) showHosts();
+  }
   else if (b.dataset.remove) {
     if (!await ask(`移除「${b.dataset.name}」？它会立即断开，要重新配对才能再用。`, '移除')) return showDevices();
     await post('/api/devices/remove', { id: b.dataset.remove }).catch(() => {});
     showDevices();
   }
   else if (act === 'logout') {
-    if (!await ask('取消本机配对？之后要在电脑上重新运行 npm run pair 才能再用。', '取消配对')) return;
+    if (!await ask('取消当前电脑的配对？其他已保存的电脑不受影响。', '取消配对')) return;
+    const cur = activeHost();
     await post('/api/logout').catch(() => {});
     store.set('token', null); store.set('key', null);
-    authed = false; ws?.close();
+    if (cur) await removeHost(cur.id);
+    else { authed = false; ws?.close(); showUnpaired(); }
   }
 });
 
@@ -935,6 +1164,8 @@ const nearBottom = () => list.scrollHeight - list.scrollTop - list.clientHeight 
 let lastChat = null;
 function renderChat(chat) {
   lastChat = chat;
+  // pickMenu leaves "切换中…" until the server confirms; also clear it once bubbles refresh.
+  if (/^切换中/.test($('msg').textContent || '')) status('');
   $('empty').hidden = !!chat;
   $('older').hidden = !chat;
   $('pickMode').hidden = !chat?.mode;
