@@ -501,14 +501,19 @@ async function api(path, opts = {}) {
 }
 const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body || {}) });
 
-// Pairing links look like <app>#pair=<url key>.<one-time code>.
+// Pairing links look like <app>#pair=<url key>.<one-time code>[&from=<other app url>].
 function parsePair(text) {
   const m = /[#&]pair=([\w-]{43})\.([\w-]{16,})/.exec(text || '');
   return m ? { key: m[1], code: m[2] } : null;
 }
+function pairFromApp(hash) {
+  const m = /[#&]from=([^&]+)/.exec(hash || '');
+  if (!m) return null;
+  try { return normalizeAppUrl(decodeURIComponent(m[1])); } catch { return null; }
+}
 let pending = parsePair(location.hash);
 if (pending) {
-  pending.appUrl = normalizeAppUrl(appAddress());
+  pending.appUrl = pairFromApp(location.hash) || normalizeAppUrl(appAddress());
   history.replaceState(null, '', location.pathname + location.search);
 }
 // Opened from a notification: <app>#win=<window id>.
@@ -522,8 +527,9 @@ if (pending) {
 window.addEventListener('hashchange', () => {
   const p = parsePair(location.hash);
   if (!p) return;
+  const from = pairFromApp(location.hash);
   history.replaceState(null, '', location.pathname + location.search);
-  pending = { ...p, appUrl: normalizeAppUrl(appAddress()) };
+  pending = { ...p, appUrl: from || normalizeAppUrl(appAddress()) };
   boot();
 });
 store.set('pw', null);
@@ -553,18 +559,11 @@ function pastePair(text) {
   if (!p) return showUnpaired('这不是配对链接（应包含 #pair=…）');
   let target;
   try { target = new URL(text.trim()); } catch {}
-  // Different host/path: keep pairing in-place via absolute url.json (same github.io origin shares storage).
+  // Keep the current shell page (multi-host UI). Only the encrypted url.json target changes.
+  // Never jump the Android WebView to another Pages path — that often loads a stale/stock menu.
   if (target && /^https?:$/.test(target.protocol)) {
     const appUrl = normalizeAppUrl(target.href);
-    const here = normalizeAppUrl(appAddress());
-    if (appUrl !== here && target.host !== location.host) {
-      // Truly different origin: let the Android shell / browser navigate.
-      if (inApp) return window.CursorRemoteApp.setUrl(target.href);
-      location.href = target.href;
-      return;
-    }
     pending = { ...p, appUrl };
-    upsertHost({ appUrl, key: p.key });
     applyHost(upsertHost({ appUrl, key: p.key }));
     boot();
     return;
@@ -880,10 +879,10 @@ function showMainMenu() {
     : `<button class="opt" data-act="appUpdate"><span class="lbl">检查 App 更新（当前 v${esc(appVersion)}）</span></button>`;
   const hostTag = activeHost()?.name ? `<span class="tag">${esc(activeHost().name)}</span>` : '';
   openSheet('main', `<h3>菜单</h3>
-    <button class="opt" data-act="hosts"><span class="lbl">我的电脑<span class="sub">多台电脑切换 · v9</span></span>${hostTag}</button>
+    <button class="opt" data-act="hosts"><span class="lbl">我的电脑<span class="sub">多台电脑切换 · v10</span></span>${hostTag}</button>
     ${notifyItem}
     ${inApp && appVersion ? update : ''}
-    ${inApp ? '<button class="opt" data-act="changeUrl"><span class="lbl">更换 App 壳地址<span class="sub">一般不用改；添加电脑请用「我的电脑」</span></span></button>'
+    ${inApp ? '<button class="opt" data-act="changeUrl"><span class="lbl">更换 App 壳地址<span class="sub">请固定为 personal 的 Pages；加电脑用「我的电脑」</span></span></button>'
       : standalone() ? '' : '<button class="opt" data-act="install"><span class="lbl">安装到手机桌面（像 App 一样打开）</span></button>'}
     <button class="opt" data-act="reconnect"><span class="lbl">重新连接</span></button>
     <button class="opt" data-act="voice"><span class="lbl">语音按钮<span class="sub">输入法键盘自带麦克风的话用不着</span></span><span class="switch ${store.get('voice') === 'on' ? 'on' : ''}"></span></button>
